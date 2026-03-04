@@ -11,9 +11,17 @@ from tkinter import scrolledtext, messagebox
 import threading
 import sys
 import os
+import io
 from datetime import datetime
+from urllib.request import urlopen, Request
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 import session_manager as sm
 from bot_engine import InstagramBot
@@ -42,6 +50,7 @@ class App:
         self.bot = InstagramBot(
             log_callback=self._log,
             status_callback=self._set_status,
+            image_callback=self._set_post_image,
         )
         self.root = tk.Tk()
         self.root.withdraw()
@@ -196,11 +205,19 @@ class App:
         self.ent_profile.insert(0, "https://www.instagram.com/username/")
 
         tk.Label(il, text="Posts to like", font=FONT, bg=BG_PANEL, fg=FG).pack(anchor="w")
-        self.ent_num = tk.Entry(il, font=FONT, width=8, bg=ENTRY_BG, fg=ENTRY_FG,
+        num_row = tk.Frame(il, bg=BG_PANEL)
+        num_row.pack(anchor="w", pady=(2, 12))
+
+        self.ent_num = tk.Entry(num_row, font=FONT, width=8, bg=ENTRY_BG, fg=ENTRY_FG,
                                  insertbackground=FG, relief="flat",
                                  highlightthickness=1, highlightcolor=ACCENT)
-        self.ent_num.pack(anchor="w", pady=(2, 12))
+        self.ent_num.pack(side="left")
         self.ent_num.insert(0, "10")
+
+        self.btn_all = tk.Button(num_row, text="All", font=FONT_SM, width=6,
+                                  bg=ACCENT2, fg="white", activebackground="#2980b9",
+                                  relief="flat", cursor="hand2", command=self._on_all)
+        self.btn_all.pack(side="left", padx=(8, 0))
 
         self.btn_begin = tk.Button(il, text="\u25B6  Begin", font=FONT_LG, width=18,
                                     bg="#27ae60", fg="white", activebackground="#2ecc71",
@@ -248,31 +265,46 @@ class App:
         # VERTICAL DIVIDER
         tk.Frame(top, bg="#111", width=4).grid(row=0, column=1, sticky="ns")
 
-        # RIGHT — status & info
+        # RIGHT — image preview + status
         right = tk.Frame(top, bg=BG_PANEL)
         right.grid(row=0, column=2, sticky="nsew", padx=(2, 0))
         ir = tk.Frame(right, bg=BG_PANEL)
         ir.pack(fill="both", expand=True, padx=15, pady=15)
 
-        tk.Label(ir, text="Bot Status", font=FONT_LG, bg=BG_PANEL, fg=FG).pack(anchor="w")
-        tk.Label(ir, text="Running headless \u2014 no browser window.\n"
-                 "All actions happen via Instagram's Private API.\n"
-                 "Much faster & lighter than browser automation.",
-                 font=FONT_SM, bg=BG_PANEL, fg=FG_DIM, justify="left").pack(anchor="w", pady=(5, 15))
-
-        self.lbl_status = tk.Label(ir, text="Status: Idle", font=FONT,
+        # Status row
+        status_row = tk.Frame(ir, bg=BG_PANEL)
+        status_row.pack(fill="x")
+        self.lbl_status = tk.Label(status_row, text="Status: Idle", font=FONT,
                                     bg=BG_PANEL, fg="#2ecc71")
-        self.lbl_status.pack(anchor="w", pady=5)
-
-        self.lbl_liked = tk.Label(ir, text="Posts liked: 0", font=FONT,
+        self.lbl_status.pack(side="left")
+        self.lbl_liked = tk.Label(status_row, text="Liked: 0", font=FONT,
                                    bg=BG_PANEL, fg=FG)
-        self.lbl_liked.pack(anchor="w", pady=2)
+        self.lbl_liked.pack(side="right")
 
+        # ── Image preview area ──
+        self.preview_frame = tk.Frame(ir, bg="#000000", relief="flat",
+                                       highlightbackground=ACCENT2,
+                                       highlightthickness=1)
+        self.preview_frame.pack(fill="both", expand=True, pady=(8, 5))
+
+        self.img_label = tk.Label(self.preview_frame, bg="#000000",
+                                   text="Post preview will appear here",
+                                   font=FONT_SM, fg=FG_DIM)
+        self.img_label.pack(fill="both", expand=True)
+        self._current_photo = None  # prevent garbage collection
+
+        self.lbl_caption = tk.Label(ir, text="", font=FONT_SM,
+                                     bg=BG_PANEL, fg=FG_DIM, anchor="w",
+                                     wraplength=400)
+        self.lbl_caption.pack(fill="x", pady=(0, 5))
+
+        # ── Liked links list ──
         tk.Label(ir, text="Liked Post Links", font=FONT_SM,
-                 bg=BG_PANEL, fg=FG_DIM).pack(anchor="w", pady=(15, 3))
+                 bg=BG_PANEL, fg=FG_DIM).pack(anchor="w", pady=(3, 2))
         self.links_list = tk.Listbox(ir, font=FONT_MONO, bg=LOG_BG, fg=LOG_FG,
-                                      selectbackground=ACCENT2, relief="flat", height=8)
-        self.links_list.pack(fill="both", expand=True)
+                                      selectbackground=ACCENT2, relief="flat",
+                                      height=5)
+        self.links_list.pack(fill="both")
 
         # HORIZONTAL DIVIDER
         tk.Frame(self.main_win, bg="#111", height=4).pack(fill="x", padx=8, pady=4)
@@ -280,7 +312,17 @@ class App:
         # BOTTOM — log
         lf = tk.Frame(self.main_win, bg=BG)
         lf.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        tk.Label(lf, text="Activity Log", font=FONT_SM, bg=BG, fg=FG_DIM).pack(anchor="w")
+
+        log_header = tk.Frame(lf, bg=BG)
+        log_header.pack(fill="x")
+        tk.Label(log_header, text="Activity Log", font=FONT_SM, bg=BG, fg=FG_DIM).pack(side="left")
+
+        self.head_on = False
+        self.btn_head = tk.Button(
+            log_header, text="Show Head: OFF", font=("Segoe UI", 9, "bold"),
+            width=16, bg=ACCENT, fg="white", activebackground="#c0392b",
+            relief="flat", cursor="hand2", command=self._toggle_head)
+        self.btn_head.pack(side="right")
         self.log_box = scrolledtext.ScrolledText(
             lf, font=FONT_MONO, bg=LOG_BG, fg=LOG_FG,
             insertbackground=FG, relief="flat", height=10,
@@ -290,6 +332,7 @@ class App:
         self.log_box.tag_config("success", foreground="#2ecc71")
         self.log_box.tag_config("info",    foreground="#3498db")
         self.log_box.tag_config("heart",   foreground="#e94560")
+        self.log_box.tag_config("head",    foreground="#9b59b6")
 
         self._log("[+] Ready. Enter a profile URL or @username and click Begin.")
 
@@ -326,6 +369,36 @@ class App:
 
         threading.Thread(target=task, daemon=True).start()
 
+    def _on_all(self):
+        """Like all posts on the profile in randomized batches."""
+        url = self.ent_profile.get().strip()
+        if not url or url == "https://www.instagram.com/username/":
+            messagebox.showwarning("Missing", "Enter a profile URL or @username.")
+            return
+        try:
+            mn = float(self.ent_dmin.get().strip())
+            mx = float(self.ent_dmax.get().strip())
+            if mn < 0 or mx < mn:
+                raise ValueError
+            self.bot.delay_min = mn
+            self.bot.delay_max = mx
+        except ValueError:
+            messagebox.showwarning("Invalid", "Check delay values (min < max, both ≥ 0).")
+            return
+
+        self.bot.use_random_delay = self.delay_on
+
+        self.btn_begin.config(state="disabled")
+        self.btn_pause.config(state="normal")
+        self.btn_stop.config(state="normal")
+        self.btn_all.config(state="disabled")
+
+        def task():
+            self.bot.like_profile_posts(url, num_posts=0, like_all=True)
+            self.root.after(0, self._on_bot_done)
+
+        threading.Thread(target=task, daemon=True).start()
+
     def _on_pause(self):
         if self.bot.paused:
             self.bot.resume()
@@ -346,12 +419,55 @@ class App:
         self.btn_stop.config(state="disabled")
         self._refresh_links()
 
+    def _set_post_image(self, url, caption=""):
+        """Download and display the current post's thumbnail."""
+        def _do_image():
+            try:
+                if not HAS_PIL:
+                    self.img_label.config(text="Install Pillow for previews:\npip install Pillow")
+                    return
+                if not hasattr(self, "img_label"):
+                    return
+                # fetch image from CDN
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                raw = urlopen(req, timeout=8).read()
+                img = Image.open(io.BytesIO(raw))
+
+                # resize to fit the preview frame, maintaining aspect ratio
+                frame_w = self.preview_frame.winfo_width() or 350
+                frame_h = self.preview_frame.winfo_height() or 280
+                img.thumbnail((frame_w, frame_h), Image.LANCZOS)
+
+                photo = ImageTk.PhotoImage(img)
+                self.img_label.config(image=photo, text="")
+                self._current_photo = photo  # prevent GC
+
+                if caption:
+                    self.lbl_caption.config(text=f"\u201C{caption}\u201D")
+                else:
+                    self.lbl_caption.config(text="")
+            except Exception as e:
+                self.img_label.config(text=f"Could not load preview\n{e}")
+        try:
+            self.root.after(0, _do_image)
+        except Exception:
+            pass
+
     def _toggle_delay(self):
         self.delay_on = not self.delay_on
         self.btn_dtoggle.config(
             text="ON" if self.delay_on else "OFF",
             bg="#27ae60" if self.delay_on else "#95a5a6")
         self.bot.use_random_delay = self.delay_on
+
+    def _toggle_head(self):
+        self.head_on = not self.head_on
+        if self.head_on:
+            self.btn_head.config(text="Show Head: ON", bg="#27ae60")
+            self.bot.set_head_mode(True)
+        else:
+            self.btn_head.config(text="Show Head: OFF", bg=ACCENT)
+            self.bot.set_head_mode(False)
 
     # ── logging (thread-safe) ─────────────────────────────────
     def _log(self, msg):
@@ -370,6 +486,8 @@ class App:
                     tag = "success"
                 elif "[\u2665]" in msg:
                     tag = "heart"
+                elif "[HEAD]" in msg:
+                    tag = "head"
                 elif "[~]" in msg:
                     tag = "info"
                 self.log_box.insert("end", line, tag)

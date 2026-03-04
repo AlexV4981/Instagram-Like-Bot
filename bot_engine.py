@@ -12,6 +12,7 @@ import time
 import random
 import traceback
 import logging
+import http.client
 
 from instagrapi import Client
 from instagrapi.exceptions import (
@@ -27,16 +28,54 @@ logger = logging.getLogger("bot_engine")
 
 
 class InstagramBot:
-    def __init__(self, log_callback=None, status_callback=None):
+    def __init__(self, log_callback=None, status_callback=None, image_callback=None):
         self.cl: Client | None = None
         self.log = log_callback or print
         self.set_status = status_callback or (lambda s: None)
+        self.set_image = image_callback or (lambda url, caption: None)
         self.running = False
         self.paused = False
         self.use_random_delay = True
         self.delay_min = 2.0
         self.delay_max = 5.0
         self.liked_count = 0
+        self.head_mode = False
+        self._log_handler = None
+
+    def set_head_mode(self, enabled: bool):
+        """Toggle verbose API logging (the 'head')."""
+        self.head_mode = enabled
+        if enabled:
+            self._enable_verbose_logging()
+            self.log("[HEAD] Verbose mode ON — showing API requests & responses")
+        else:
+            self._disable_verbose_logging()
+            self.log("[HEAD] Verbose mode OFF")
+
+    def _enable_verbose_logging(self):
+        """Hook into instagrapi + urllib3 + http.client to show traffic."""
+        # instagrapi's own logger
+        for name in ("instagrapi", "instagrapi.mixins", "urllib3", "urllib3.connectionpool"):
+            lg = logging.getLogger(name)
+            lg.setLevel(logging.DEBUG)
+            if self._log_handler is None:
+                self._log_handler = _BotLogHandler(self.log)
+                self._log_handler.setFormatter(
+                    logging.Formatter("[HEAD] %(name)s: %(message)s")
+                )
+            if self._log_handler not in lg.handlers:
+                lg.addHandler(self._log_handler)
+        # http.client debug (shows raw headers)
+        http.client.HTTPConnection.debuglevel = 1
+
+    def _disable_verbose_logging(self):
+        """Remove verbose hooks."""
+        for name in ("instagrapi", "instagrapi.mixins", "urllib3", "urllib3.connectionpool"):
+            lg = logging.getLogger(name)
+            lg.setLevel(logging.WARNING)
+            if self._log_handler and self._log_handler in lg.handlers:
+                lg.removeHandler(self._log_handler)
+        http.client.HTTPConnection.debuglevel = 0
 
     # ── helpers ───────────────────────────────────────────────
     def _delay(self, base=2.0):
@@ -103,7 +142,7 @@ class InstagramBot:
             return False
 
     # ── like posts ────────────────────────────────────────────
-    def like_profile_posts(self, profile_input: str, num_posts: int = 20):
+    def like_profile_posts(self, profile_input: str, num_posts: int = 20, like_all: bool = False):
         """Fetch a user's recent posts and like them."""
         self.running = True
         self.paused = False
@@ -137,7 +176,8 @@ class InstagramBot:
             self.log(f"[~] Fetching up to {num_posts} recent posts...")
             self.set_status("Fetching posts...")
             try:
-                medias = self.cl.user_medias(user_id, amount=num_posts)
+                amount = user_info.media_count if like_all else num_posts
+                medias = self.cl.user_medias(user_id, amount=amount)
             except Exception as e:
                 self.log(f"[ERROR] Could not fetch posts: {e}")
                 self.running = False
@@ -148,8 +188,13 @@ class InstagramBot:
                 self.running = False
                 return
 
-            self.log(f"[+] Retrieved {len(medias)} posts. Starting likes...")
+            if like_all:
+                self.log(f"[+] Retrieved {len(medias)} posts. Liking all in randomized batches...")
+            else:
+                self.log(f"[+] Retrieved {len(medias)} posts. Starting likes...")
             self.set_status("Liking posts...")
+
+            batch_threshold = random.randint(5, 15) if like_all else None
 
             for i, media in enumerate(medias):
                 self._check_state()
@@ -157,6 +202,17 @@ class InstagramBot:
 
                 post_url = f"https://www.instagram.com/p/{media.code}/"
                 media_id = self.cl.media_id(media.pk)
+
+                # show current post image in GUI
+                try:
+                    thumb = str(media.thumbnail_url) if media.thumbnail_url else None
+                    if not thumb and media.resources:
+                        thumb = str(media.resources[0].thumbnail_url)
+                    caption_text = (media.caption_text or "")[:80]
+                    if thumb:
+                        self.set_image(thumb, caption_text)
+                except Exception:
+                    pass
 
                 # check if already liked
                 if media.has_liked:
@@ -178,6 +234,17 @@ class InstagramBot:
                     self.log(f"[!] Failed to like post {i+1}: {e}")
 
                 self._delay(2.5)
+
+                # extra randomized cooldown between batches when liking all posts
+                if like_all and (i + 1) < len(medias):
+                    if (i + 1) % batch_threshold == 0:
+                        cool = random.uniform(20, 60)
+                        self.log(f"[~] Cooling down for {cool:.1f}s to mimic human behaviour...")
+                        end = time.time() + cool
+                        while time.time() < end:
+                            self._check_state()
+                            time.sleep(0.5)
+                        batch_threshold = random.randint(5, 15)
 
             self.log(f"[✓] Done! Liked {self.liked_count} out of {len(medias)} posts.")
             self.set_status("Finished")
@@ -225,3 +292,20 @@ class InstagramBot:
                 self.log("[+] Logged out.")
             except Exception:
                 pass
+
+
+class _BotLogHandler(logging.Handler):
+    """Routes Python logging messages to the bot's log callback."""
+    def __init__(self, log_callback):
+        super().__init__()
+        self._log = log_callback
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # truncate very long messages (base64 blobs, etc.)
+            if len(msg) > 300:
+                msg = msg[:297] + "..."
+            self._log(msg)
+        except Exception:
+            pass
